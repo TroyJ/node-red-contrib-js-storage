@@ -172,6 +172,7 @@ function extractTypeScriptFunc(data) {
 
 // js2json creates Node-RED node object out of js file contents
 function js2json(data) {
+  if (Buffer.isBuffer(data)) data = data.toString("utf8");
   const context = { jsstore: {}, module: {} };
   vm.createContext(context);
   const getNode = "\n" + ConvertNode.toString() + "ConvertNode(jsstore);";
