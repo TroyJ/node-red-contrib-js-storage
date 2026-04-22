@@ -260,12 +260,65 @@ function indent(code) {
     .join("\n");
 }
 
-// readJSONArrayFromJSFiles reads dirPath and returns JSON array from .flows.js files
+// subDirs lists the three subdirectories used in the structured layout.
+const subDirs = ["tabs", "subflows", "config-nodes"];
+
+// hasSubDirLayout returns true if dirPath contains the structured subdirectory layout.
+function hasSubDirLayout(dirPath) {
+  return fs.existsSync(fspath.join(dirPath, "tabs")) &&
+         fs.existsSync(fspath.join(dirPath, "subflows")) &&
+         fs.existsSync(fspath.join(dirPath, "config-nodes"));
+}
+
+// collectFlowsJsFiles recursively collects all .flows.js files under dirPath,
+// returning objects { relPath, absPath } where relPath is relative to dirPath.
+function collectFlowsJsFiles(dirPath) {
+  const results = [];
+  function walk(absDir, relDir) {
+    for (const entry of fs.readdirSync(absDir)) {
+      const absEntry = fspath.join(absDir, entry);
+      const relEntry = relDir ? relDir + "/" + entry : entry;
+      const stat = fs.statSync(absEntry);
+      if (stat.isDirectory()) {
+        walk(absEntry, relEntry);
+      } else if (entry.endsWith(storageExtension)) {
+        results.push({ relPath: relEntry, absPath: absEntry });
+      }
+    }
+  }
+  walk(dirPath, "");
+  return results;
+}
+
+// nodeSubDir computes the relative subdirectory path and filename for a node
+// given sets of tab IDs and subflow definition IDs.
+function nodeSubDir(node, tabIds, sfIds) {
+  const safeType = node.type.replace(/[^a-z0-9]/gi, "_").toLowerCase();
+  const id = node.id;
+
+  if (node.type === "tab") {
+    return { subdir: "tabs/tab." + id, fileName: "_tab." + id + storageExtension };
+  }
+  if (node.type === "subflow" && !node.z) {
+    return { subdir: "subflows/subflow." + id, fileName: "_subflow." + id + storageExtension };
+  }
+  if (node.z && tabIds.has(node.z)) {
+    return { subdir: "tabs/tab." + node.z, fileName: safeType + "." + id + storageExtension };
+  }
+  if (node.z && sfIds.has(node.z)) {
+    return { subdir: "subflows/subflow." + node.z, fileName: safeType + "." + id + storageExtension };
+  }
+  return { subdir: "config-nodes", fileName: safeType + "." + id + storageExtension };
+}
+
+// readJSONArrayFromJSFiles reads dirPath and returns JSON array from .flows.js files.
+// Supports both the structured subdirectory layout (tabs/, subflows/, config-nodes/)
+// and the legacy flat layout for backward compatibility.
 function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
   let out = [];
   let fileNames = [];
 
-  // Read _order.json file
+  // Read _order.json file (entries are relative paths in structured layout, bare filenames in flat)
   try {
     fileNames = JSON.parse(
       fs.readFileSync(fspath.join(dirPath, orderFileName))
@@ -275,17 +328,29 @@ function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
   }
 
   try {
-    const files = fs.readdirSync(dirPath);
-    for (let fileName of files) {
-      if (!fileName.endsWith(storageExtension)) continue; // Ignore unsupported files
-      const data = fs.readFileSync(fspath.join(dirPath, fileName));
+    let files; // array of { relPath, absPath }
+
+    if (hasSubDirLayout(dirPath)) {
+      // Structured layout: walk the three subdirectories
+      files = collectFlowsJsFiles(dirPath).filter(
+        ({ relPath }) => !relPath.startsWith("_order")
+      );
+    } else {
+      // Legacy flat layout: all .flows.js files directly in dirPath
+      files = fs.readdirSync(dirPath)
+        .filter((f) => f.endsWith(storageExtension))
+        .map((f) => ({ relPath: f, absPath: fspath.join(dirPath, f) }));
+    }
+
+    for (const { relPath, absPath } of files) {
+      const data = fs.readFileSync(absPath);
       const json = js2json(data);
-      // Note before version 1.0.3 nodes contained _order attribute. The following provides backward compatibility to support it (as well as the new _order.json file).
       if (fileNames.length > 0) {
-        json._order = fileNames.indexOf(fileName);
+        json._order = fileNames.indexOf(relPath);
       }
       out.push(json);
     }
+
     // Keep order to ensure flows hash is equal with UI
     out.sort((a, b) => a._order - b._order);
     out = out.map((n) => {
@@ -302,36 +367,59 @@ function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
   return out;
 }
 
-// writeJSONArrayToJSFiles creates .flows.js files in dirPath directory out of content (JSON array)
+// writeJSONArrayToJSFiles creates .flows.js files in the structured subdirectory layout.
 async function writeJSONArrayToJSFiles(dirPath, content) {
-  const fileNames = [];
+  const fileNames = []; // relative paths, e.g. "tabs/tab.ID/_tab.ID.flows.js"
   const contentClone = JSON.parse(JSON.stringify(content));
+
+  // First pass: build sets of tab IDs and subflow definition IDs for routing
+  const tabIds = new Set();
+  const sfIds = new Set();
+  for (const node of contentClone) {
+    if (node.type === "tab") tabIds.add(node.id);
+    if (node.type === "subflow" && !node.z) sfIds.add(node.id);
+  }
+
   try {
-    for (let json of contentClone) {
-      const [data, fileName] = json2js(json);
-      fileNames.push(fileName);
-      await saveFile(dirPath, fileName, data);
+    for (const node of contentClone) {
+      const { subdir, fileName } = nodeSubDir(node, tabIds, sfIds);
+      const absSubdir = fspath.join(dirPath, subdir);
+      fs.mkdirSync(absSubdir, { recursive: true });
+
+      // json2js generates file content and a flat filename; we use our own fileName
+      const [data] = json2js(node);
+      await saveFile(absSubdir, fileName, data);
+      fileNames.push(subdir + "/" + fileName);
     }
   } catch (e) {
     throw new Error(`${logPrefix}Failed saving to ${dirPath} (${e.message})`);
   }
 
-  // Remove extra .flows.js files in the directory
+  // Remove orphaned .flows.js files across all subdirectories
   try {
-    const files = fs.readdirSync(dirPath);
-    for (let fileName of files) {
-      if (
-        fileName.endsWith(storageExtension) &&
-        !fileNames.includes(fileName)
-      ) {
-        fs.unlinkSync(fspath.join(dirPath, fileName));
+    const existing = collectFlowsJsFiles(dirPath).map(({ relPath }) => relPath);
+    for (const relPath of existing) {
+      if (!fileNames.includes(relPath)) {
+        fs.unlinkSync(fspath.join(dirPath, relPath));
+      }
+    }
+    // Remove empty leaf directories (tabs/tab.ID/ left behind after node deletion)
+    for (const topDir of subDirs) {
+      const absTop = fspath.join(dirPath, topDir);
+      if (!fs.existsSync(absTop)) continue;
+      if (topDir === "config-nodes") continue; // flat, no subdirs to prune
+      for (const child of fs.readdirSync(absTop)) {
+        const absChild = fspath.join(absTop, child);
+        if (fs.statSync(absChild).isDirectory() && fs.readdirSync(absChild).length === 0) {
+          fs.rmdirSync(absChild);
+        }
       }
     }
   } catch (e) {
     throw new Error(`${logPrefix}Failed cleaning up old files (${e.message})`);
   }
 
-  // Save _order.json file - keeps the exact order of nodes to ensure flows hash is equal with UI
+  // Save _order.json at dirPath root with relative paths
   try {
     await saveFile(dirPath, orderFileName, JSON.stringify(fileNames, null, 2));
   } catch (e) {

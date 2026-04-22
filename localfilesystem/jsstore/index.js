@@ -88,9 +88,12 @@ function init(_settings, _runtime) {
   }
   flowsDirFullPath = fspath.join(settings.userDir, flowsDir);
 
-  // Create js file directory if one does not exist
+  // Create js file directory and structured subdirectories if they do not exist
   if (!fs.existsSync(flowsDirFullPath)) {
     fs.mkdirSync(flowsDirFullPath);
+  }
+  for (const sub of ["tabs", "subflows", "config-nodes"]) {
+    fs.mkdirSync(fspath.join(flowsDirFullPath, sub), { recursive: true });
   }
 
   return Promise.resolve();
