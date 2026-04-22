@@ -2,6 +2,23 @@
 
 Node-RED storage plugin to store flows as `.js` files for easy readability, code reviews, and scans.
 
+---
+
+**This is a fork of [barshociaj/node-red-contrib-js-storage](https://github.com/barshociaj/node-red-contrib-js-storage) (v1.0.5).**
+
+**What was added:** Support for `node-red-contrib-ts` TypeScript nodes. The upstream read
+path evaluates each `.flows.js` file through a JavaScript VM (`vm.runInContext`). TypeScript
+syntax in `func` fields causes a `SyntaxError` on startup. This fork detects TypeScript
+nodes, transpiles the `func` body to JavaScript for VM evaluation using `ts.transpileModule`,
+then restores the original TypeScript source on the reconstituted node object. The write path
+is unchanged — TypeScript source is stored verbatim in the `.flows.js` file.
+
+This fork is maintained for the [bali-home-assistant](https://github.com/TroyJ/bali-home-assistant)
+project. See [`docs/node-red/js-storage.md`](https://github.com/TroyJ/bali-home-assistant/blob/main/docs/node-red/js-storage.md)
+in that repo for full context, installation details, and the `updated` timestamp caveat.
+
+---
+
 ## Overview
 
 Node-RED stores flows in a JSON file with dynamic order and stringified code. Inspired by `node-red-contrib-yaml-storage` plugin, the js-storage plugin takes readability further and splits flows JSON file into individual JavaScript files - valid CommonJS modules that are easy to read, scan, and commit.
