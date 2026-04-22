@@ -45,6 +45,16 @@ const textEscapes = {
   $: "\\$",
 };
 
+// Lazy TypeScript loader — tries standard require first, then the Node-RED container path.
+let _ts = undefined;
+function loadTypeScript() {
+  if (_ts !== undefined) return _ts;
+  try { _ts = require("typescript"); return _ts; } catch {}
+  try { _ts = require("/config/node_modules/typescript"); return _ts; } catch {}
+  _ts = null;
+  return _ts;
+}
+
 // textAsTemplateLiteral escapes text to form the body of template literal
 function textAsTemplateLiteral(txt) {
   let out = "";
@@ -90,13 +100,74 @@ function ConvertNode(jsstore) {
   // Remove first and last char (newline) from template literals
   for (let txt of ["info", "template"]) {
     if (Node[txt] && Node[txt] !== "") {
-      console.log("REMOVING:", Node[txt]);
       Node[txt] = Node[txt].slice(1, -1);
-      console.log("....TO:", Node[txt]);
     }
   }
 
   jsstore.Node = Node;
+}
+
+// extractTypeScriptFunc extracts the TypeScript func body from a .flows.js file,
+// transpiles it to JavaScript for VM evaluation, and returns both the original
+// TypeScript source and the modified file content with transpiled JS substituted.
+//
+// The write path stores TypeScript source verbatim in the func block. The VM cannot
+// parse TypeScript syntax, so we transpile only for the purpose of VM evaluation,
+// then restore the original source after the node object is reconstructed.
+function extractTypeScriptFunc(data) {
+  const ts = loadTypeScript();
+  if (!ts) {
+    throw new Error(
+      logPrefix +
+        "TypeScript compiler not available. Cannot read typescript node. " +
+        "Install the 'typescript' package or ensure it is present at /config/node_modules/typescript."
+    );
+  }
+
+  const headerMatch = data.match(/Node\.func = async function \([^)]*\) \{/);
+  if (!headerMatch) return null;
+
+  // bodyStart is the index of the first character after the opening "{\n"
+  const bodyStart = headerMatch.index + headerMatch[0].length + 1;
+
+  // The func block closing "}" is the last "\n}" before "module.exports = Node;"
+  const moduleExportsIdx = data.lastIndexOf("\nmodule.exports");
+  const closingIdx = data.lastIndexOf("\n}", moduleExportsIdx);
+
+  if (closingIdx <= bodyStart) return null;
+
+  const indentedBody = data.substring(bodyStart, closingIdx);
+
+  // Un-indent to recover the original TypeScript source (indent() adds 2 spaces to every line)
+  const originalTS = indentedBody
+    .split("\n")
+    .map((line) =>
+      line.startsWith(funcIndent) ? line.substring(funcIndent.length) : line
+    )
+    .join("\n");
+
+  // Transpile TypeScript to JavaScript so the VM can evaluate the file
+  const transpiled = ts.transpileModule(originalTS, {
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.CommonJS,
+    },
+  });
+
+  // Re-indent the transpiled JS to match the expected file structure
+  const indentedTranspiled = transpiled.outputText
+    .trimEnd()
+    .split("\n")
+    .map((line) => (line.length > 0 ? funcIndent + line : line))
+    .join("\n");
+
+  // Substitute the transpiled JS into the file content
+  const transpiledData =
+    data.substring(0, bodyStart) +
+    indentedTranspiled +
+    data.substring(closingIdx);
+
+  return { originalTS, transpiledData };
 }
 
 // js2json creates Node-RED node object out of js file contents
@@ -104,8 +175,28 @@ function js2json(data) {
   const context = { jsstore: {}, module: {} };
   vm.createContext(context);
   const getNode = "\n" + ConvertNode.toString() + "ConvertNode(jsstore);";
-  vm.runInContext(data + getNode, context);
-  return context.jsstore.Node;
+
+  let originalTS = null;
+  let dataForVM = data;
+
+  // TypeScript nodes store TS source in func — the VM cannot parse TS syntax directly.
+  // Extract and transpile the func body before VM evaluation, then restore the original.
+  if (data.includes('"type": "typescript"')) {
+    const extracted = extractTypeScriptFunc(data);
+    if (extracted) {
+      originalTS = extracted.originalTS;
+      dataForVM = extracted.transpiledData;
+    }
+  }
+
+  vm.runInContext(dataForVM + getNode, context);
+  const node = context.jsstore.Node;
+
+  if (originalTS !== null) {
+    node.func = originalTS;
+  }
+
+  return node;
 }
 
 // json2js returns js file contents and the filename (where filename is the type + node id + .flows.js extension) out of Node-RED node object

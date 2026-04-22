@@ -89,6 +89,33 @@ const a = "b" escaped
 `
 */
 
+const tsNode = {
+  id: "cfabd7ceca8b1be4",
+  type: "typescript",
+  z: "c218da47c0ce2ea0",
+  name: "build_ha_globals",
+  func: "interface Foo {\n  bar: string;\n}\nconst x: Foo = { bar: 'hello' };\nreturn { payload: x };",
+  updated: "1776763536505",
+  useVm: false,
+  x: 100,
+  y: 100,
+  wires: [[]],
+};
+
+test("typescript node json should round-trip through js with source preserved", () => {
+  const json = JSON.parse(JSON.stringify(tsNode));
+  const [code] = _json2js(json);
+  // Written file must contain raw TypeScript source (not transpiled JS)
+  expect(code).toContain("interface Foo {");
+  expect(code).toContain("bar: string;");
+  // Round-trip: read back must restore original TypeScript source
+  const result = _js2json(code);
+  expect(result.func).toEqual(tsNode.func);
+  expect(result.updated).toEqual(tsNode.updated);
+  expect(result.type).toEqual("typescript");
+  expect(result.id).toEqual(tsNode.id);
+});
+
 test("node json should be converted to js", () => {
   const json = JSON.parse(JSON.stringify(node));
   const [result, id] = _json2js(json);
