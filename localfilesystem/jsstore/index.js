@@ -131,6 +131,10 @@ async function saveFlows(flows, user) {
     return;
   }
 
+  // Normalise in-place: tabs (received order) → subflows (name+id) → rest (id).
+  // Required so H_save == H_get — prevents spurious "modified" notification on restart.
+  convert.normalizeFlowsOrder(flows);
+
   var flowData;
 
   if (settings.flowFilePretty) {

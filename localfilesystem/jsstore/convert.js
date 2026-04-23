@@ -17,7 +17,7 @@ const vm = require("vm");
 
 const storageExtension = ".flows.js";
 const logPrefix = "node-red-contrib-js-storage: ";
-const orderFileName = "_order.json";
+const tabOrderFileName = "_tab-order.txt";
 
 const nodePrefix = `const Node = `;
 const nodeSuffix = `module.exports = Node;`;
@@ -260,6 +260,25 @@ function indent(code) {
     .join("\n");
 }
 
+// normalizeFlowsOrder sorts flows in-place to canonical order:
+//   1. type:"tab" nodes — preserved in received sequence (user's tab bar order)
+//   2. type:"subflow" definition nodes (!node.z) — sorted by name then id
+//   3. everything else — sorted by id
+// Called by saveFlows so H_save == H_get on next startup.
+function normalizeFlowsOrder(flows) {
+  const tabs   = flows.filter(n => n.type === 'tab');
+  const sfDefs = flows.filter(n => n.type === 'subflow' && !n.z);
+  const rest   = flows.filter(n => n.type !== 'tab' && !(n.type === 'subflow' && !n.z));
+
+  sfDefs.sort((a, b) => {
+    const c = (a.name || '').localeCompare(b.name || '');
+    return c !== 0 ? c : a.id.localeCompare(b.id);
+  });
+  rest.sort((a, b) => a.id.localeCompare(b.id));
+
+  flows.splice(0, flows.length, ...tabs, ...sfDefs, ...rest);
+}
+
 // subDirs lists the three subdirectories used in the structured layout.
 const subDirs = ["tabs", "subflows", "config-nodes"];
 
@@ -311,20 +330,21 @@ function nodeSubDir(node, tabIds, sfIds) {
   return { subdir: "config-nodes", fileName: safeType + "." + id + storageExtension };
 }
 
-// readJSONArrayFromJSFiles reads dirPath and returns JSON array from .flows.js files.
+// readJSONArrayFromJSFiles reads dirPath and returns JSON array from .flows.js files
+// in canonical order: tabs (per _tab-order.txt), subflow defs (name+id), rest (id).
 // Supports both the structured subdirectory layout (tabs/, subflows/, config-nodes/)
 // and the legacy flat layout for backward compatibility.
 function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
   let out = [];
-  let fileNames = [];
 
-  // Read _order.json file (entries are relative paths in structured layout, bare filenames in flat)
+  // Read tabs/_tab-order.txt for tab sequence.
+  // On any error (missing file, bad content) fall back to sorting tabs by id.
+  let tabOrder = [];
   try {
-    fileNames = JSON.parse(
-      fs.readFileSync(fspath.join(dirPath, orderFileName))
-    );
+    const raw = fs.readFileSync(fspath.join(dirPath, 'tabs', tabOrderFileName), 'utf8');
+    tabOrder = raw.split('\n').map(l => l.trim()).filter(Boolean);
   } catch (e) {
-    console.warn(`${logPrefix}Invalid order file, skipping (${e.message})`);
+    // fallback: tabOrder stays empty
   }
 
   try {
@@ -332,9 +352,7 @@ function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
 
     if (hasSubDirLayout(dirPath)) {
       // Structured layout: walk the three subdirectories
-      files = collectFlowsJsFiles(dirPath).filter(
-        ({ relPath }) => !relPath.startsWith("_order")
-      );
+      files = collectFlowsJsFiles(dirPath);
     } else {
       // Legacy flat layout: all .flows.js files directly in dirPath
       files = fs.readdirSync(dirPath)
@@ -342,21 +360,30 @@ function readJSONArrayFromJSFiles(dirPath, emptyResponse) {
         .map((f) => ({ relPath: f, absPath: fspath.join(dirPath, f) }));
     }
 
-    for (const { relPath, absPath } of files) {
+    for (const { absPath } of files) {
       const data = fs.readFileSync(absPath);
-      const json = js2json(data);
-      if (fileNames.length > 0) {
-        json._order = fileNames.indexOf(relPath);
-      }
-      out.push(json);
+      out.push(js2json(data));
     }
 
-    // Keep order to ensure flows hash is equal with UI
-    out.sort((a, b) => a._order - b._order);
-    out = out.map((n) => {
-      delete n._order;
-      return n;
+    // Sort to canonical order
+    const tabOrderMap = new Map(tabOrder.map((name, i) => [name, i]));
+    const tabs   = out.filter(n => n.type === 'tab');
+    const sfDefs = out.filter(n => n.type === 'subflow' && !n.z);
+    const rest   = out.filter(n => n.type !== 'tab' && !(n.type === 'subflow' && !n.z));
+
+    tabs.sort((a, b) => {
+      const ai = tabOrderMap.get('tab.' + a.id) ?? Infinity;
+      const bi = tabOrderMap.get('tab.' + b.id) ?? Infinity;
+      return ai !== bi ? ai - bi : a.id.localeCompare(b.id);
     });
+    sfDefs.sort((a, b) => {
+      const c = (a.name || '').localeCompare(b.name || '');
+      return c !== 0 ? c : a.id.localeCompare(b.id);
+    });
+    rest.sort((a, b) => a.id.localeCompare(b.id));
+
+    out = [...tabs, ...sfDefs, ...rest];
+
     if (out.length === 0) {
       return emptyResponse;
     }
@@ -419,17 +446,25 @@ async function writeJSONArrayToJSFiles(dirPath, content) {
     throw new Error(`${logPrefix}Failed cleaning up old files (${e.message})`);
   }
 
-  // Save _order.json at dirPath root with relative paths
+  // Save _tab-order.txt in tabs/ with one directory name per line
   try {
-    await saveFile(dirPath, orderFileName, JSON.stringify(fileNames, null, 2));
+    const tabDirNames = contentClone
+      .filter(n => n.type === 'tab')
+      .map(n => 'tab.' + n.id);
+    await saveFile(
+      fspath.join(dirPath, 'tabs'),
+      tabOrderFileName,
+      tabDirNames.join('\n') + '\n'
+    );
   } catch (e) {
-    throw new Error(`${logPrefix}Error saving ${orderFileName} (${e.message})`);
+    throw new Error(`${logPrefix}Error saving ${tabOrderFileName} (${e.message})`);
   }
 }
 
 module.exports = {
   readJSONArrayFromJSFiles,
   writeJSONArrayToJSFiles,
+  normalizeFlowsOrder,
 
   // test exports
   _js2json: js2json,
